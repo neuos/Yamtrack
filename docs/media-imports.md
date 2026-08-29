@@ -89,6 +89,13 @@ Amazon does not provide a viewing-history CSV export on its own. Generate one wi
 !!! note
     This export step is manual for now. An automated importer may be added in the future if Amazon exposes a more direct way to retrieve viewing history.
 
+## Netflix
+
+Download your viewing history CSV directly from <https://www.netflix.com/settings/viewing-history> — no need to request a full "Download your personal information" data export. Upload the CSV via **Import → Netflix**.
+
+!!! note
+    This export step is manual for now. An automated importer may be added in the future if Netflix exposes a more direct way to retrieve viewing history.
+
 ## Yamtrack CSV format
 
 Use this format to bulk-import media into YamTrack. Every row represents a single media instance.
