@@ -9,10 +9,14 @@ from django.utils.dateparse import parse_datetime
 
 import app
 from app import helpers as app_helpers
-from app.models import MediaTypes, Sources, Status
+from app.models import TV, Episode, MediaTypes, Movie, Season, Sources, Status
 from app.providers import services
 from integrations.imports import helpers
 from integrations.imports.helpers import MediaImportError, MediaImportUnexpectedError
+from integrations.imports.tmdb_watch_history import (
+    TMDBWatchHistoryImportMixin,
+    WatchEntry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +89,7 @@ def importer(token, user, mode):
     return simkl_importer.import_data()
 
 
-class SimklImporter:
+class SimklImporter(TMDBWatchHistoryImportMixin):
     """Class to handle importing user data from Simkl."""
 
     SIMKL_API_BASE_URL = "https://api.simkl.com"
@@ -103,13 +107,12 @@ class SimklImporter:
         self.mode = mode
         self.warnings = []
 
-        # Track existing media for "new" mode
+        self._init_watch_history_state()
+
+        # Anime isn't TMDB-backed, so it still uses the older shared helper
+        # pattern rather than the TMDB watch-history mixin.
         self.existing_media = helpers.get_existing_media(user)
-
-        # Track media IDs to delete in overwrite mode
         self.to_delete = defaultdict(lambda: defaultdict(set))
-
-        # Track bulk creation lists for each media type
         self.bulk_media = defaultdict(list)
 
         logger.info(
@@ -130,12 +133,11 @@ class SimklImporter:
         helpers.cleanup_existing_media(self.to_delete, self.user)
         helpers.bulk_create_media(self.bulk_media, self.user)
 
-        imported_counts = {
-            media_type: len(media_list)
-            for media_type, media_list in self.bulk_media.items()
-        }
+        imported_counts, deduplicated_messages = self.finalize_watch_history_import()
+        for media_type, media_list in self.bulk_media.items():
+            if media_list:
+                imported_counts[media_type] = len(media_list)
 
-        deduplicated_messages = "\n".join(dict.fromkeys(self.warnings))
         return imported_counts, deduplicated_messages
 
     def _get_user_list(self):
@@ -190,17 +192,6 @@ class SimklImporter:
                     )
                     continue
 
-                # Check if we should process this entry based on mode
-                if not helpers.should_process_media(
-                    self.existing_media,
-                    self.to_delete,
-                    MediaTypes.TV.value,
-                    Sources.TMDB.value,
-                    str(tmdb_id),
-                    self.mode,
-                ):
-                    continue
-
                 tv_status = self._get_status(tv["status"])
 
                 try:
@@ -222,32 +213,39 @@ class SimklImporter:
                         continue
                     raise
 
-                tv_item, _ = app.models.Item.objects.get_or_create(
-                    media_id=tmdb_id,
-                    source=Sources.TMDB.value,
-                    media_type=MediaTypes.TV.value,
-                    defaults={
-                        "title": metadata["title"],
-                        "image": metadata["image"],
-                    },
-                )
+                tv_id = str(tmdb_id)
+                tv_item = self._get_or_create_item(MediaTypes.TV.value, tv_id, metadata)
 
-                tv_instance = app.models.TV(
-                    item=tv_item,
-                    user=self.user,
-                    status=tv_status,
-                    score=tv["user_rating"],
-                    notes=tv["memo"]["text"] if tv["memo"] != {} else "",
+                tv_instance, _created, skip = self._resolve_or_create(
+                    TV,
+                    self.tv_creates,
+                    self.tv_updates,
+                    MediaTypes.TV.value,
+                    tv_id,
+                    tv_item,
                 )
-                tv_instance._history_date = self._get_history_date(tv)
-                self.bulk_media[MediaTypes.TV.value].append(tv_instance)
                 existing_tv_ids.add(tmdb_id)
+                if skip:
+                    continue
+
+                self._apply_show_status(
+                    tv_instance,
+                    WatchEntry(
+                        media_type=MediaTypes.TV.value,
+                        display_title=title,
+                        status=tv_status,
+                        score=tv["user_rating"],
+                        notes=tv["memo"]["text"] if tv["memo"] != {} else "",
+                        watched_at=self._get_history_date(tv),
+                    ),
+                )
 
                 if season_numbers:
                     self._process_seasons_and_episodes(
                         tv,
                         tv_instance,
                         metadata,
+                        tv_status,
                     )
 
             except Exception as error:
@@ -256,67 +254,80 @@ class SimklImporter:
 
         logger.info("Processed %d tv shows", len(tv_list))
 
-    def _process_seasons_and_episodes(self, tv, tv_instance, metadata):
+    def _process_seasons_and_episodes(self, tv, tv_instance, metadata, tv_status):
         """Process seasons and episodes for a TV show."""
-        tmdb_id = tv["show"]["ids"]["tmdb"]
+        tmdb_id = str(tv["show"]["ids"]["tmdb"])
 
         for season in tv["seasons"]:
             season_number = season["number"]
             episodes = season["episodes"]
             season_metadata = metadata[f"season/{season_number}"]
 
-            season_item, _ = app.models.Item.objects.get_or_create(
-                media_id=tmdb_id,
-                source=Sources.TMDB.value,
-                media_type=MediaTypes.SEASON.value,
+            season_item = self._get_or_create_item(
+                MediaTypes.SEASON.value,
+                tmdb_id,
+                {"title": metadata["title"], "image": season_metadata["image"]},
                 season_number=season_number,
-                defaults={
-                    "title": metadata["title"],
-                    "image": season_metadata["image"],
-                },
             )
 
             if episodes[-1]["number"] == season_metadata["max_progress"]:
                 season_status = Status.COMPLETED.value
             else:
-                season_status = tv_instance.status
+                season_status = tv_status
 
-            season_instance = app.models.Season(
-                item=season_item,
-                user=self.user,
-                related_tv=tv_instance,
-                status=season_status,
+            season_instance, _created, season_skip = self._resolve_or_create(
+                Season,
+                self.season_creates,
+                self.season_updates,
+                MediaTypes.SEASON.value,
+                tmdb_id,
+                season_item,
+                season_number=season_number,
+                create_kwargs={
+                    "related_tv": tv_instance,
+                    "status": Status.IN_PROGRESS.value,
+                },
             )
-            season_instance._history_date = self._get_history_date(tv)
-            self.bulk_media[MediaTypes.SEASON.value].append(season_instance)
+            if not season_skip:
+                self._apply_show_status(
+                    season_instance,
+                    WatchEntry(
+                        media_type=MediaTypes.SEASON.value,
+                        display_title=f"{metadata['title']} S{season_number}",
+                        status=season_status,
+                        watched_at=self._get_history_date(tv),
+                    ),
+                )
 
             # Process episodes
             for episode in episodes:
                 ep_img = self._get_episode_image(episode, season_number, metadata)
-                episode_item, _ = app.models.Item.objects.get_or_create(
-                    media_id=tmdb_id,
-                    source=Sources.TMDB.value,
-                    media_type=MediaTypes.EPISODE.value,
+                episode_item = self._get_or_create_item(
+                    MediaTypes.EPISODE.value,
+                    tmdb_id,
+                    {"title": metadata["title"], "image": ep_img},
                     season_number=season_number,
                     episode_number=episode["number"],
-                    defaults={
-                        "title": metadata["title"],
-                        "image": ep_img,
-                    },
                 )
 
-                episode_instance = app.models.Episode(
-                    item=episode_item,
-                    related_season=season_instance,
-                    end_date=self._get_date(episode.get("watched_at")),
+                episode_instance, _created, episode_skip = self._resolve_or_create(
+                    Episode,
+                    self.episode_creates,
+                    self.episode_updates,
+                    MediaTypes.EPISODE.value,
+                    tmdb_id,
+                    episode_item,
+                    season_number=season_number,
+                    episode_number=episode["number"],
+                    create_kwargs={"related_season": season_instance},
                 )
+                if episode_skip:
+                    continue
+
+                episode_instance.end_date = self._get_date(episode.get("watched_at"))
                 episode_instance._history_date = (
-                    self._get_date(
-                        episode.get("watched_at"),
-                    )
-                    or timezone.now()
+                    episode_instance.end_date or timezone.now()
                 )
-                self.bulk_media[MediaTypes.EPISODE.value].append(episode_instance)
 
     def _get_episode_image(self, episode, season_number, metadata):
         """Get the image for the episode."""
@@ -349,17 +360,6 @@ class SimklImporter:
                     )
                     continue
 
-                # Check if we should process this entry based on mode
-                if not helpers.should_process_media(
-                    self.existing_media,
-                    self.to_delete,
-                    MediaTypes.MOVIE.value,
-                    Sources.TMDB.value,
-                    str(tmdb_id),
-                    self.mode,
-                ):
-                    continue
-
                 movie_status = self._get_status(movie["status"])
 
                 try:
@@ -373,29 +373,37 @@ class SimklImporter:
                         continue
                     raise
 
-                movie_item, _ = app.models.Item.objects.get_or_create(
-                    media_id=tmdb_id,
-                    source=Sources.TMDB.value,
-                    media_type=MediaTypes.MOVIE.value,
-                    defaults={
-                        "title": metadata["title"],
-                        "image": metadata["image"],
-                    },
+                movie_id = str(tmdb_id)
+                movie_item = self._get_or_create_item(
+                    MediaTypes.MOVIE.value,
+                    movie_id,
+                    metadata,
                 )
 
-                movie_instance = app.models.Movie(
-                    item=movie_item,
-                    user=self.user,
-                    status=movie_status,
-                    score=movie["user_rating"],
-                    progress=1 if movie_status == Status.COMPLETED.value else 0,
-                    start_date=self._get_date(movie.get("last_watched_at")),
-                    end_date=self._get_date(movie.get("last_watched_at")),
-                    notes=movie["memo"]["text"] if movie["memo"] != {} else "",
+                movie_instance, _created, skip = self._resolve_or_create(
+                    Movie,
+                    self.movie_creates,
+                    self.movie_updates,
+                    MediaTypes.MOVIE.value,
+                    movie_id,
+                    movie_item,
+                )
+                existing_movie_ids.add(tmdb_id)
+                if skip:
+                    continue
+
+                self._apply_movie_fields(
+                    movie_instance,
+                    WatchEntry(
+                        media_type=MediaTypes.MOVIE.value,
+                        display_title=title,
+                        status=movie_status,
+                        score=movie["user_rating"],
+                        notes=movie["memo"]["text"] if movie["memo"] != {} else "",
+                        watched_at=self._get_date(movie.get("last_watched_at")),
+                    ),
                 )
                 movie_instance._history_date = self._get_history_date(movie)
-                self.bulk_media[MediaTypes.MOVIE.value].append(movie_instance)
-                existing_movie_ids.add(tmdb_id)
 
             except Exception as error:
                 msg = f"Error processing entry: {movie}"
