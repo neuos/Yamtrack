@@ -8,6 +8,7 @@ from app.mixins import disable_fetch_releases
 from app.models import MediaTypes
 from app.templatetags import app_tags
 from integrations.imports import (
+    amazon,
     anilist,
     goodreads,
     helpers,
@@ -151,6 +152,12 @@ def import_steam(username, user_id, mode):
 def import_imdb(file, user_id, mode):
     """Celery task for importing media data from IMDB."""
     return import_media(imdb.importer, file, user_id, mode)
+
+
+@shared_task(name="Import from Amazon Prime")
+def import_amazon(file, user_id, mode):
+    """Celery task for importing media data from Amazon Prime."""
+    return import_media(amazon.importer, file, user_id, mode)
 
 
 @shared_task(name="Import from GoodReads")
