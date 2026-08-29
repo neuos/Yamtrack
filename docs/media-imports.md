@@ -91,10 +91,21 @@ Amazon does not provide a viewing-history CSV export on its own. Generate one wi
 
 ## Netflix
 
-Download your viewing history CSV directly from <https://www.netflix.com/settings/viewing-history> — no need to request a full "Download your personal information" data export. Upload the CSV via **Import → Netflix**.
+### Automatic (recommended)
 
-!!! note
-    This export step is manual for now. An automated importer may be added in the future if Netflix exposes a more direct way to retrieve viewing history.
+Yamtrack can import directly from a live Netflix account and optionally keep it in sync on a schedule (daily or every 2 days, same as the other sources), instead of you re-exporting a CSV each time:
+
+1. While logged into Netflix in your browser, open devtools → Application/Storage → Cookies → `netflix.com`, and copy the values of the `NetflixId` and `SecureNetflixId` cookies.
+2. In **Import → Netflix**, select **Automatic (connect account)**, paste both values, and submit.
+3. Pick which Netflix profile to import from (a household account can have several), then import once or set a schedule.
+
+**Security note:** these two cookie values are a live Netflix session — anyone with them can browse, and in some cases change settings, on your account. Treat them like a password. They're encrypted at rest the same way other sources' OAuth tokens are, but only paste them into Yamtrack, never anywhere else.
+
+This relies on Netflix's internal (unofficial, undocumented) viewing-activity API rather than a public one, so it can break if Netflix changes that API — a manual CSV export remains available as a fallback. A scheduled import will start failing (visible as a failed entry in Import History) once the session cookies expire; reconnect using the same steps to refresh them.
+
+### Manual (CSV export)
+
+Download your viewing history CSV directly from <https://www.netflix.com/settings/viewing-history> — no need to request a full "Download your personal information" data export. Upload the CSV via **Import → Netflix**.
 
 ## Yamtrack CSV format
 

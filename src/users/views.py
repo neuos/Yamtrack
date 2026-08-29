@@ -297,7 +297,20 @@ def integrations(request):
 def import_data(request):
     """Render the import data settings page."""
     import_tasks = request.user.get_import_tasks()
-    return render(request, "users/import_data.html", {"import_tasks": import_tasks})
+
+    netflix_state = request.GET.get("netflix_state")
+    netflix_session = request.session.get(netflix_state) if netflix_state else None
+    netflix_profiles = netflix_session["profiles"] if netflix_session else None
+
+    return render(
+        request,
+        "users/import_data.html",
+        {
+            "import_tasks": import_tasks,
+            "netflix_state": netflix_state if netflix_session else None,
+            "netflix_profiles": netflix_profiles,
+        },
+    )
 
 
 @require_GET

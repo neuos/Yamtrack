@@ -19,7 +19,8 @@ from django.views.decorators.http import require_GET, require_POST
 import users
 from app import helpers as app_helpers
 from integrations import exports, tasks
-from integrations.imports import anilist, helpers, simkl, trakt
+from integrations.imports import anilist, helpers, netflix_api, simkl, trakt
+from integrations.imports.helpers import MediaImportError
 from integrations.webhooks import emby, jellyfin, plex
 
 logger = logging.getLogger(__name__)
@@ -501,6 +502,87 @@ def import_netflix(request):
         request,
         "The task to import media from Netflix CSV file has been queued.",
     )
+    return redirect("import_data")
+
+
+@require_POST
+def import_netflix_connect(request):
+    """View for validating Netflix session cookies and listing profiles."""
+    netflix_id = request.POST.get("netflix_id")
+    secure_netflix_id = request.POST.get("secure_netflix_id")
+
+    if not netflix_id or not secure_netflix_id:
+        messages.error(request, "Both Netflix cookie values are required.")
+        return redirect("import_data")
+
+    try:
+        session = netflix_api.discover_session(netflix_id, secure_netflix_id)
+    except MediaImportError as error:
+        messages.error(request, str(error))
+        return redirect("import_data")
+
+    state_token = secrets.token_urlsafe(32)
+    request.session[state_token] = {
+        "netflix_id": helpers.encrypt(netflix_id),
+        "secure_netflix_id": helpers.encrypt(secure_netflix_id),
+        "profiles": session["profiles"],
+        "mode": request.POST["mode"],
+        "frequency": request.POST["frequency"],
+        "time": request.POST["time"],
+    }
+    return redirect(f"{reverse('import_data')}?netflix_state={state_token}")
+
+
+@require_POST
+def import_netflix_auto(request):
+    """View for finalizing a live Netflix import/schedule for a chosen profile."""
+    state_token = request.POST.get("state")
+    state = request.session.pop(state_token, None) if state_token else None
+
+    if not state:
+        messages.error(
+            request,
+            "Netflix connection expired. Reconnect your Netflix account.",
+        )
+        return redirect("import_data")
+
+    profile_guid = request.POST.get("profile_guid")
+    profile = next(
+        (p for p in state["profiles"] if p["guid"] == profile_guid),
+        None,
+    )
+    if not profile:
+        messages.error(request, "Select a Netflix profile.")
+        return redirect("import_data")
+
+    mode = state["mode"]
+    frequency = state["frequency"]
+    import_time = state["time"]
+
+    if frequency == "once":
+        tasks.import_netflix.delay(
+            user_id=request.user.id,
+            mode=mode,
+            netflix_id=state["netflix_id"],
+            secure_netflix_id=state["secure_netflix_id"],
+            profile_guid=profile_guid,
+        )
+        messages.info(request, "The task to import media from Netflix has been queued.")
+    else:
+        helpers.create_import_schedule(
+            profile["name"],
+            request,
+            mode,
+            frequency,
+            import_time,
+            "Netflix",
+            task_kwargs={
+                "netflix_id": state["netflix_id"],
+                "secure_netflix_id": state["secure_netflix_id"],
+                "profile_guid": profile_guid,
+            },
+        )
+
     return redirect("import_data")
 
 

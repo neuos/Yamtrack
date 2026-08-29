@@ -6,6 +6,7 @@ from datetime import datetime
 from django.utils import timezone
 
 from app.models import MediaTypes, Sources
+from integrations.imports import helpers, netflix_api
 from integrations.imports.helpers import MediaImportError, MediaImportUnexpectedError
 from integrations.imports.tmdb_watch_history import (
     TMDBWatchHistoryImportMixin,
@@ -27,9 +28,34 @@ _TV_INDICATOR_RE = re.compile(
 _SEASON_NUMBER_RE = re.compile(r"(\d+)\s*$")
 
 
-def importer(file, user, mode):
-    """Import media from a Netflix viewing history CSV export."""
-    netflix_importer = NetflixImporter(file, user, mode)
+def importer(
+    file,
+    user,
+    mode,
+    netflix_id=None,
+    secure_netflix_id=None,
+    profile_guid=None,
+):
+    """Import media from a Netflix viewing history CSV export or a live account.
+
+    Args:
+        file (File, optional): Uploaded Netflix viewing-history CSV export
+        user: Django user object to import data for
+        mode (str): Import mode ("new" or "overwrite")
+        netflix_id (str, optional): Encrypted `NetflixId` session cookie
+        secure_netflix_id (str, optional): Encrypted `SecureNetflixId` cookie
+        profile_guid (str, optional): Netflix profile to import from
+    """
+    if file:
+        netflix_importer = NetflixImporter(file, user, mode)
+    else:
+        netflix_importer = NetflixAPIImporter(
+            user,
+            mode,
+            netflix_id,
+            secure_netflix_id,
+            profile_guid,
+        )
     return netflix_importer.import_data()
 
 
@@ -221,3 +247,66 @@ class NetflixImporter(TMDBWatchHistoryImportMixin):
 
         logger.warning("Could not parse Netflix date: %s", date_str)
         return None
+
+
+class NetflixAPIImporter(NetflixImporter):
+    """Import a live Netflix account's viewing history via the Shakti API.
+
+    Reuses all of NetflixImporter's title-parsing/TMDB-matching logic
+    unchanged by normalizing API entries into the same {"Title", "Date"} row
+    shape the CSV parser produces, then feeding them through `_resolve_row`.
+    """
+
+    def __init__(self, user, mode, netflix_id, secure_netflix_id, profile_guid):
+        """Initialize the importer with encrypted session cookies."""
+        self.user = user
+        self.mode = mode
+        self.encrypted_netflix_id = netflix_id
+        self.encrypted_secure_netflix_id = secure_netflix_id
+        self.profile_guid = profile_guid
+        self.warnings = []
+
+        self._init_watch_history_state()
+
+        logger.info(
+            "Initialized Netflix API importer for user %s with mode %s",
+            user.username,
+            mode,
+        )
+
+    def _read_rows(self):
+        """Fetch viewing activity from Netflix and normalize it into CSV rows."""
+        netflix_id = helpers.decrypt(self.encrypted_netflix_id)
+        secure_netflix_id = helpers.decrypt(self.encrypted_secure_netflix_id)
+
+        session = netflix_api.discover_session(netflix_id, secure_netflix_id)
+        raw_entries = netflix_api.get_viewing_activity(
+            netflix_id,
+            secure_netflix_id,
+            self.profile_guid,
+            session["build_id"],
+        )
+        return [self._entry_to_row(entry) for entry in raw_entries]
+
+    def _entry_to_row(self, entry):
+        """Normalize one Shakti viewingactivity entry into a CSV-shaped row.
+
+        The Shakti API is unofficial and undocumented, so this maps the
+        fields observed by third-party tooling; it may need adjusting
+        against a real account's response.
+        """
+        title = entry.get("title", "")
+        date_str = entry.get("dateStr")
+        if not date_str:
+            epoch = entry.get("date")
+            date_str = self._format_epoch(epoch) if epoch is not None else ""
+        return {"Title": title, "Date": date_str}
+
+    def _format_epoch(self, epoch):
+        """Format a Netflix epoch timestamp (seconds or milliseconds) as M/D/YY."""
+        epoch_millis_threshold = 10**12
+        seconds = epoch / 1000 if epoch > epoch_millis_threshold else epoch
+        return datetime.fromtimestamp(
+            seconds,
+            tz=timezone.get_current_timezone(),
+        ).strftime("%m/%d/%y")

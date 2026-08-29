@@ -162,9 +162,30 @@ def import_amazon(file, user_id, mode):
 
 
 @shared_task(name="Import from Netflix")
-def import_netflix(file, user_id, mode):
-    """Celery task for importing media data from Netflix."""
-    return import_media(netflix.importer, file, user_id, mode)
+def import_netflix(
+    user_id,
+    mode,
+    *,
+    file=None,
+    netflix_id=None,
+    secure_netflix_id=None,
+    profile_guid=None,
+    username=None,  # noqa: ARG001 (create_import_schedule always injects username)
+):
+    """Celery task for importing media data from Netflix.
+
+    Can import from an uploaded CSV export (file provided) or a live Netflix
+    account via its Shakti API (netflix_id/secure_netflix_id/profile_guid).
+    """
+    return import_media(
+        netflix.importer,
+        file,
+        user_id,
+        mode,
+        netflix_id=netflix_id,
+        secure_netflix_id=secure_netflix_id,
+        profile_guid=profile_guid,
+    )
 
 
 @shared_task(name="Import from GoodReads")

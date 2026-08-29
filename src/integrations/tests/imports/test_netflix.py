@@ -5,7 +5,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 
 from app.models import TV, Episode, MediaTypes, Movie, Season, Status
-from integrations.imports import netflix
+from integrations.imports import helpers, netflix
 
 mock_path = Path(__file__).resolve().parent.parent / "mock_data"
 
@@ -13,6 +13,8 @@ METADATA_PATCH_TARGET = (
     "integrations.imports.tmdb_watch_history.services.get_media_metadata"
 )
 SEARCH_PATCH_TARGET = "integrations.imports.tmdb_watch_history.services.search"
+DISCOVER_SESSION_TARGET = "integrations.imports.netflix.netflix_api.discover_session"
+GET_ACTIVITY_TARGET = "integrations.imports.netflix.netflix_api.get_viewing_activity"
 
 
 class ImportNetflix(TestCase):
@@ -162,3 +164,85 @@ class ImportNetflix(TestCase):
         self.assertEqual(importer_instance._parse_date("1/2/2024").year, 2024)
         self.assertIsNone(importer_instance._parse_date(""))
         self.assertIsNone(importer_instance._parse_date("not-a-date"))
+
+
+class ImportNetflixAPI(TestCase):
+    """Test importing media from a live Netflix account via the Shakti API."""
+
+    def setUp(self):
+        """Create a test user for each import test."""
+        self.user = get_user_model().objects.create_user(
+            username="netflix-api-import-user",
+        )
+
+    def test_entry_to_row_prefers_datestr(self):
+        """A raw entry with dateStr is used as-is."""
+        importer_instance = netflix.NetflixAPIImporter(
+            self.user,
+            "new",
+            helpers.encrypt("nid"),
+            helpers.encrypt("snid"),
+            "guid-1",
+        )
+
+        row = importer_instance._entry_to_row({"title": "Tenet", "dateStr": "1/2/24"})
+
+        self.assertEqual(row, {"Title": "Tenet", "Date": "1/2/24"})
+
+    def test_entry_to_row_formats_epoch_seconds_and_millis(self):
+        """A raw entry with only a unix epoch is formatted to M/D/YY."""
+        importer_instance = netflix.NetflixAPIImporter(
+            self.user,
+            "new",
+            helpers.encrypt("nid"),
+            helpers.encrypt("snid"),
+            "guid-1",
+        )
+
+        seconds_row = importer_instance._entry_to_row(
+            {"title": "Tenet", "date": 1704171600},
+        )
+        millis_row = importer_instance._entry_to_row(
+            {"title": "Tenet", "date": 1704171600000},
+        )
+
+        self.assertEqual(seconds_row["Date"], millis_row["Date"])
+
+    @patch(METADATA_PATCH_TARGET)
+    @patch(SEARCH_PATCH_TARGET)
+    @patch(GET_ACTIVITY_TARGET)
+    @patch(DISCOVER_SESSION_TARGET)
+    def test_import_netflix_api(
+        self,
+        mock_discover_session,
+        mock_get_activity,
+        mock_search,
+        mock_get_media_metadata,
+    ):
+        """A live-account import normalizes API entries the same way as CSV rows."""
+        mock_discover_session.return_value = {"build_id": "vabc123", "profiles": []}
+        mock_get_activity.return_value = [{"title": "Tenet", "dateStr": "1/2/24"}]
+        mock_search.return_value = {
+            "results": [{"media_id": "100", "title": "Tenet", "image": ""}],
+        }
+        mock_get_media_metadata.return_value = {
+            "title": "Tenet",
+            "image": "https://example.com/tenet.jpg",
+        }
+
+        imported_counts, warnings = netflix.importer(
+            None,
+            self.user,
+            "new",
+            netflix_id=helpers.encrypt("nid"),
+            secure_netflix_id=helpers.encrypt("snid"),
+            profile_guid="guid-1",
+        )
+
+        self.assertEqual(imported_counts[MediaTypes.MOVIE.value], 1)
+        self.assertIsNone(warnings)
+        mock_discover_session.assert_called_once_with("nid", "snid")
+        mock_get_activity.assert_called_once_with("nid", "snid", "guid-1", "vabc123")
+
+        tenet = Movie.objects.get(user=self.user, item__media_id="100")
+        self.assertEqual(tenet.status, Status.COMPLETED.value)

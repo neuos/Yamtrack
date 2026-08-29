@@ -36,6 +36,16 @@ urlpatterns = [
     path("import/imdb", views.import_imdb, name="import_imdb"),
     path("import/amazon", views.import_amazon, name="import_amazon"),
     path("import/netflix", views.import_netflix, name="import_netflix"),
+    path(
+        "import/netflix/connect",
+        views.import_netflix_connect,
+        name="import_netflix_connect",
+    ),
+    path(
+        "import/netflix/auto",
+        views.import_netflix_auto,
+        name="import_netflix_auto",
+    ),
     path("import/goodreads", views.import_goodreads, name="import_goodreads"),
     path("export/csv", views.export_csv, name="export_csv"),
     path(

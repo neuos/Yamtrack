@@ -5,6 +5,10 @@ from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from django.urls import reverse
+from django_celery_beat.models import PeriodicTask
+
+from integrations.imports import helpers
+from integrations.imports.helpers import MediaImportError
 
 
 class TraktOAuthViewTests(TestCase):
@@ -136,3 +140,138 @@ class TraktExportUploadViewTests(TestCase):
 
         self.assertEqual(response.status_code, 302)
         mock_import_trakt.assert_not_called()
+
+
+class NetflixConnectViewTests(TestCase):
+    """Test validating Netflix cookies and stashing the discovered profiles."""
+
+    def setUp(self):
+        """Create and log in a user for the tests."""
+        credentials = {"username": "testuser", "password": "testpass123"}
+        self.user = get_user_model().objects.create_user(**credentials)
+        self.client.login(**credentials)
+
+    @patch("integrations.views.netflix_api.discover_session")
+    def test_valid_cookies_stash_profiles_and_redirect(self, mock_discover_session):
+        """Valid cookies redirect back to import_data with a netflix_state token."""
+        profiles = [{"guid": "guid-1", "name": "Alex", "is_kids": False}]
+        mock_discover_session.return_value = {
+            "build_id": "vabc123",
+            "profiles": profiles,
+        }
+
+        response = self.client.post(
+            reverse("import_netflix_connect"),
+            {
+                "netflix_id": "nid",
+                "secure_netflix_id": "snid",
+                "mode": "new",
+                "frequency": "once",
+                "time": "14:30",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        redirect = urlparse(response["Location"])
+        self.assertEqual(redirect.path, reverse("import_data"))
+        state_token = parse_qs(redirect.query)["netflix_state"][0]
+
+        state = self.client.session[state_token]
+        self.assertEqual(state["profiles"], profiles)
+        self.assertEqual(helpers.decrypt(state["netflix_id"]), "nid")
+        self.assertEqual(helpers.decrypt(state["secure_netflix_id"]), "snid")
+
+    @patch("integrations.views.netflix_api.discover_session")
+    def test_invalid_cookies_are_rejected(self, mock_discover_session):
+        """An invalid-session error shows a message instead of queueing anything."""
+        mock_discover_session.side_effect = MediaImportError("Invalid session.")
+        session_keys_before = set(self.client.session.keys())
+
+        response = self.client.post(
+            reverse("import_netflix_connect"),
+            {
+                "netflix_id": "nid",
+                "secure_netflix_id": "snid",
+                "mode": "new",
+                "frequency": "once",
+                "time": "14:30",
+            },
+        )
+
+        self.assertRedirects(response, reverse("import_data"))
+        self.assertEqual(set(self.client.session.keys()), session_keys_before)
+
+
+class NetflixAutoImportViewTests(TestCase):
+    """Test finalizing a live Netflix import/schedule for a chosen profile."""
+
+    def setUp(self):
+        """Create and log in a user, and stash a connected Netflix session."""
+        credentials = {"username": "testuser", "password": "testpass123"}
+        self.user = get_user_model().objects.create_user(**credentials)
+        self.client.login(**credentials)
+
+        self.profiles = [
+            {"guid": "guid-1", "name": "Alex", "is_kids": False},
+            {"guid": "guid-2", "name": "Kids", "is_kids": True},
+        ]
+
+    def _stash_state(self, **overrides):
+        state = {
+            "netflix_id": helpers.encrypt("nid"),
+            "secure_netflix_id": helpers.encrypt("snid"),
+            "profiles": self.profiles,
+            "mode": "new",
+            "frequency": "once",
+            "time": "14:30",
+            **overrides,
+        }
+        session = self.client.session
+        session["state-token"] = state
+        session.save()
+
+    @patch("integrations.views.tasks.import_netflix.delay")
+    def test_once_queues_a_task_and_clears_session(self, mock_import_netflix):
+        """A one-time import queues the task with the chosen profile."""
+        self._stash_state()
+
+        response = self.client.post(
+            reverse("import_netflix_auto"),
+            {"state": "state-token", "profile_guid": "guid-1"},
+        )
+
+        self.assertRedirects(response, reverse("import_data"))
+        mock_import_netflix.assert_called_once()
+        call_kwargs = mock_import_netflix.call_args.kwargs
+        self.assertEqual(call_kwargs["user_id"], self.user.id)
+        self.assertEqual(call_kwargs["mode"], "new")
+        self.assertEqual(call_kwargs["profile_guid"], "guid-1")
+        self.assertEqual(helpers.decrypt(call_kwargs["netflix_id"]), "nid")
+        self.assertEqual(helpers.decrypt(call_kwargs["secure_netflix_id"]), "snid")
+        self.assertNotIn("state-token", self.client.session)
+
+    @patch("integrations.views.tasks.import_netflix.delay")
+    def test_daily_creates_a_periodic_task(self, mock_import_netflix):
+        """A daily frequency schedules a PeriodicTask instead of queueing once."""
+        self._stash_state(frequency="daily")
+
+        response = self.client.post(
+            reverse("import_netflix_auto"),
+            {"state": "state-token", "profile_guid": "guid-2"},
+        )
+
+        self.assertRedirects(response, reverse("import_data"))
+        mock_import_netflix.assert_not_called()
+        periodic_task = PeriodicTask.objects.get(task="Import from Netflix")
+        self.assertIn("Kids", periodic_task.name)
+
+    @patch("integrations.views.tasks.import_netflix.delay")
+    def test_expired_state_is_rejected(self, mock_import_netflix):
+        """A missing/expired state token shows an error instead of importing."""
+        response = self.client.post(
+            reverse("import_netflix_auto"),
+            {"state": "not-a-real-token", "profile_guid": "guid-1"},
+        )
+
+        self.assertRedirects(response, reverse("import_data"))
+        mock_import_netflix.assert_not_called()
