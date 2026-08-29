@@ -462,6 +462,27 @@ def import_imdb(request):
     return redirect("import_data")
 
 
+def import_amazon(request):
+    """View for importing Amazon Prime Video watch history from a CSV file."""
+    file = request.FILES.get("amazon_csv")
+
+    if not file:
+        messages.error(request, "Amazon Prime CSV file is required.")
+        return redirect("import_data")
+
+    mode = request.POST["mode"]
+    tasks.import_amazon.delay(
+        file=request.FILES["amazon_csv"],
+        user_id=request.user.id,
+        mode=mode,
+    )
+    messages.info(
+        request,
+        "The task to import media from Amazon Prime CSV file has been queued.",
+    )
+    return redirect("import_data")
+
+
 @require_POST
 def import_goodreads(request):
     """View for importing books data from GoodReads CSV."""
