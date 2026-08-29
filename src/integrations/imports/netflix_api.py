@@ -32,22 +32,46 @@ _REACT_CONTEXT_RE = re.compile(
     re.DOTALL,
 )
 
+# A browser-like User-Agent; Netflix serves different content to obvious
+# non-browser clients (e.g. the default python-requests User-Agent).
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
-def _cookie_header(netflix_id, secure_netflix_id):
-    """Build the Cookie header value from the two session cookie values."""
-    return f"NetflixId={netflix_id}; SecureNetflixId={secure_netflix_id}"
+
+def _request_headers(netflix_id, secure_netflix_id):
+    """Build browser-like request headers carrying the session cookies."""
+    return {
+        **_BROWSER_HEADERS,
+        "Cookie": f"NetflixId={netflix_id}; SecureNetflixId={secure_netflix_id}",
+    }
 
 
 def _parse_react_context(html):
     """Extract the `netflix.reactContext` JSON blob embedded in a Netflix page."""
     match = _REACT_CONTEXT_RE.search(html)
     if not match:
+        # Never log cookies or full page content (may include account details) -
+        # just enough to tell a login-page bounce from a page-format mismatch.
+        logger.warning(
+            "Netflix /browse response (%s chars) had no reactContext blob. "
+            "Contains 'reactContext': %s. Contains 'login': %s. Prefix: %r",
+            len(html),
+            "reactContext" in html,
+            "login" in html.lower(),
+            html[:200],
+        )
         raise MediaImportError(_INVALID_SESSION_MSG)
 
     try:
         return json.loads(match.group(1))
-    except json.JSONDecodeError as error:
-        raise MediaImportError(_INVALID_SESSION_MSG) from error
+    except json.JSONDecodeError:
+        logger.exception("Netflix reactContext blob was not valid JSON")
+        raise MediaImportError(_INVALID_SESSION_MSG) from None
 
 
 def discover_session(netflix_id, secure_netflix_id):
@@ -64,7 +88,7 @@ def discover_session(netflix_id, secure_netflix_id):
         "NETFLIX",
         "GET",
         f"{NETFLIX_BASE_URL}/browse",
-        headers={"Cookie": _cookie_header(netflix_id, secure_netflix_id)},
+        headers=_request_headers(netflix_id, secure_netflix_id),
         response_format="text",
     )
     context = _parse_react_context(html)
@@ -98,7 +122,7 @@ def discover_session(netflix_id, secure_netflix_id):
 
 def get_viewing_activity(netflix_id, secure_netflix_id, profile_guid, build_id):
     """Fetch the full viewing activity for a Netflix profile, newest first."""
-    headers = {"Cookie": _cookie_header(netflix_id, secure_netflix_id)}
+    headers = _request_headers(netflix_id, secure_netflix_id)
     entries = []
     page = 0
 
