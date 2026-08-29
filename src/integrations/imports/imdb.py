@@ -2,16 +2,22 @@ import logging
 from collections import defaultdict
 from csv import DictReader
 
-from django.apps import apps
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
 import app
 import app.providers
-from app.models import MediaTypes, Sources, Status
+from app.models import TV, MediaTypes, Sources, Status
 from app.providers.services import ProviderAPIError
-from integrations.imports import helpers
-from integrations.imports.helpers import MediaImportError, MediaImportUnexpectedError
+from integrations.imports.helpers import (
+    MediaImportError,
+    MediaImportUnexpectedError,
+    join_with_commas_and,
+)
+from integrations.imports.tmdb_watch_history import (
+    TMDBWatchHistoryImportMixin,
+    WatchEntry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +49,7 @@ def importer(file, user, mode):
     return imdb_importer.import_data()
 
 
-class IMDBImporter:
+class IMDBImporter(TMDBWatchHistoryImportMixin):
     """Class to handle importing user data from IMDB CSV."""
 
     def __init__(self, file, user, mode):
@@ -59,14 +65,7 @@ class IMDBImporter:
         self.mode = mode
         self.warnings = []
 
-        # Track existing media for "new" mode
-        self.existing_media = helpers.get_existing_media(user)
-
-        # Track media IDs to delete in overwrite mode
-        self.to_delete = defaultdict(lambda: defaultdict(set))
-
-        # Track bulk creation lists for each media type
-        self.bulk_media = defaultdict(list)
+        self._init_watch_history_state()
 
         logger.info(
             "Initialized IMDB importer for user %s with mode %s",
@@ -97,7 +96,7 @@ class IMDBImporter:
                 error_msg = f"Error processing entry: {row}"
                 raise MediaImportUnexpectedError(error_msg) from error
 
-        # Second pass: add non-duplicates to bulk_media
+        # Second pass: process non-duplicate entries
         for row in rows:
             try:
                 self._process_second_pass(row, media_id_counts)
@@ -108,16 +107,7 @@ class IMDBImporter:
         # Add consolidated warnings for duplicates
         self._add_duplicate_warnings(media_id_counts, media_id_titles)
 
-        helpers.cleanup_existing_media(self.to_delete, self.user)
-        helpers.bulk_create_media(self.bulk_media, self.user)
-
-        imported_counts = {
-            media_type: len(media_list)
-            for media_type, media_list in self.bulk_media.items()
-        }
-
-        deduplicated_messages = "\n".join(dict.fromkeys(self.warnings))
-        return imported_counts, deduplicated_messages if self.warnings else None
+        return self.finalize_watch_history_import()
 
     def _process_first_pass(self, row, media_id_counts, media_id_titles):
         """First pass to identify duplicate entries and validate data."""
@@ -175,28 +165,41 @@ class IMDBImporter:
             return
 
         media_type = IMDB_TYPE_MAPPING[title_type]
+        entry = self._build_entry(row, tmdb_data, media_type)
 
-        # Check if we should process this entry based on mode
-        if not helpers.should_process_media(
-            self.existing_media,
-            self.to_delete,
-            media_type,
-            Sources.TMDB.value,
-            str(media_id),
-            self.mode,
-        ):
-            return
+        if media_type == MediaTypes.MOVIE.value:
+            self.process_movie_entry(entry)
+        else:
+            self.process_single_media_entry(entry, TV)
 
-        item, _ = self._create_or_update_item(tmdb_data, media_type)
-        instance = self._create_media_instance(item, row, media_type)
-        self.bulk_media[media_type].append(instance)
+    def _build_entry(self, row, tmdb_data, media_type):
+        """Build a WatchEntry from an IMDB row already resolved against TMDB."""
+        title = row.get("Title", "").strip()
+        rating = self._parse_rating(row.get("Your Rating", ""))
+        status = Status.COMPLETED.value if rating is not None else Status.PLANNING.value
+
+        date_created = self._parse_date(row.get("Created", ""))
+        date_modified = self._parse_date(row.get("Modified", ""))
+        date_rated = self._parse_date(row.get("Date Rated", ""))
+        dates = [date_created, date_modified, date_rated]
+        most_recent_date = max(date for date in dates if date)
+
+        return WatchEntry(
+            media_type=media_type,
+            display_title=title,
+            tmdb_id=str(tmdb_data["media_id"]),
+            image_url=tmdb_data.get("image", ""),
+            watched_at=most_recent_date,
+            status=status,
+            score=rating,
+        )
 
     def _add_duplicate_warnings(self, media_id_counts, media_id_titles):
         """Add warnings for duplicate entries."""
         for media_id, count in media_id_counts.items():
             if count > 1:
                 titles = media_id_titles[media_id]
-                title_list = helpers.join_with_commas_and(titles)
+                title_list = join_with_commas_and(titles)
                 self.warnings.append(
                     f"{title_list}: They were matched to the same TMDB ID {media_id} "
                     "- none imported",
@@ -251,55 +254,6 @@ class IMDBImporter:
             }
 
         return None
-
-    def _create_or_update_item(self, tmdb_data, media_type):
-        """Create or update the item in database."""
-        return app.models.Item.objects.update_or_create(
-            media_id=tmdb_data["media_id"],
-            source=Sources.TMDB.value,
-            media_type=media_type,
-            defaults={
-                "title": tmdb_data["title"],
-                "image": tmdb_data["image"],
-            },
-        )
-
-    def _create_media_instance(self, item, row, media_type):
-        """Create media instance with all parameters."""
-        model = apps.get_model(app_label="app", model_name=media_type)
-
-        # Parse user rating (0-10 scale)
-        rating = self._parse_rating(row.get("Your Rating", ""))
-
-        # Determine status - if user rated it, they completed it
-        status = Status.COMPLETED.value if rating is not None else Status.PLANNING.value
-
-        params = {
-            "item": item,
-            "user": self.user,
-            "score": rating,
-            "status": status,
-        }
-
-        # Parse dates
-        date_created = self._parse_date(row.get("Created", ""))
-        date_modified = self._parse_date(row.get("Modified", ""))
-        date_rated = self._parse_date(row.get("Date Rated", ""))
-
-        # filter out None dates
-        dates = [date_created, date_modified, date_rated]
-        most_recent_date = max(date for date in dates if date)
-
-        # Movies can have progress and end_date set directly.
-        # TV shows manage their own progress and dates through episodes.
-        if media_type == MediaTypes.MOVIE.value and status == Status.COMPLETED.value:
-            params["progress"] = 1
-            params["end_date"] = most_recent_date
-
-        instance = model(**params)
-        instance._history_date = most_recent_date or timezone.now()
-
-        return instance
 
     def _parse_rating(self, rating_str):
         """Parse user rating from string to decimal."""
