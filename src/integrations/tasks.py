@@ -16,6 +16,7 @@ from integrations.imports import (
     imdb,
     kitsu,
     mal,
+    netflix,
     simkl,
     steam,
     trakt,
@@ -158,6 +159,12 @@ def import_imdb(file, user_id, mode):
 def import_amazon(file, user_id, mode):
     """Celery task for importing media data from Amazon Prime."""
     return import_media(amazon.importer, file, user_id, mode)
+
+
+@shared_task(name="Import from Netflix")
+def import_netflix(file, user_id, mode):
+    """Celery task for importing media data from Netflix."""
+    return import_media(netflix.importer, file, user_id, mode)
 
 
 @shared_task(name="Import from GoodReads")
