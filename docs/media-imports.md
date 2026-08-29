@@ -82,6 +82,13 @@ Steam import requires a Steam API key and your Steam ID 64.
 - **Steam ID 64**: Instead of your Steam username, you must provide your Steam ID 64. You can find it on your Steam account details page under your username.
 - **Profile Visibility**: Your Steam profile must be public if the API key you are using is not linked to the Steam ID you are requesting.
 
+## Amazon Prime Video
+
+Amazon does not provide a viewing-history CSV export on its own. Generate one with the community [watch-history-exporter-for-amazon-prime-video](https://github.com/caret-collective/watch-history-exporter-for-amazon-prime-video) tool, then upload the resulting CSV via **Import → Amazon Prime**.
+
+!!! note
+    This export step is manual for now. An automated importer may be added in the future if Amazon exposes a more direct way to retrieve viewing history.
+
 ## Yamtrack CSV format
 
 Use this format to bulk-import media into YamTrack. Every row represents a single media instance.
